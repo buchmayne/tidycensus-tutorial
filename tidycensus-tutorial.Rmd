@@ -1,0 +1,260 @@
+---
+title: "Introduction to Working with Census Data in R"
+author: "Marley Buchman"
+date: "7/14/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidycensus)
+library(tigris)
+library(sf)
+library(mapview)
+```
+
+
+[tidycensus website is a great resource](https://walker-data.com/tidycensus/)
+
+You will need a census api key to use `tidycensus`, to register for a census api key follow this [link](https://api.census.gov/data/key_signup.html) and sign up.
+```{r api_key}
+# ?tidycensus::census_api_key()
+
+# Sys.getenv("CENSUS_API_KEY")
+```
+
+Borrowed from the tidycensus site:
+"There are two major functions implemented in tidycensus: `get_decennial`, which grants access to the 1990, 2000, and 2010 decennial US Census APIs, and `get_acs`, which grants access to the 5-year American Community Survey APIs"
+
+THe biggest difference is that the decennial census is conducted every ten years and is a full count, whereas the american community survey is conducted every year but a sample. The tradeoff is between accuracy and vintage (time period of the data). In tidycensus you are able to access data from two different summary files for the decennial census, sf1 and sf3. sf1 contains data that is asked to every households, where sf3 is again a sample asked to 1 in every 6 households (I don't believe that the sf3 sample is offered in both 2000, and 2010).
+
+"The 5-year estimates from the ACS are "period" estimates that represent data collected over a period of time. The primary advantage of using multiyear estimates is the increased statistical reliability of the data for less populated areas and small population subgroups." (Source: census.gov). When working with acs data you should never compare the estimates between two five year periods. The acs also offers one-year estimates for geographies with populations above 65,000. 
+
+This was a very quick primer on the different census datasets. It is important to read some of the technical documentation provided by the census if you're going to be conducting research using census data. The rest of this tutorial will be focused on working with census data in R.
+
+How to know what data is available?
+```{r load_variables}
+acs5_2018_variables <- load_variables(year = 2018, dataset = "acs5")
+
+# View(acs5_2018_variables)
+```
+
+
+```{r get_acs example}
+total_population_acs_var_id <- "B01003_001"
+
+county_pop_acs5 <- get_acs(geography = "county", variables = total_population_acs_var_id, year = 2018, state = "OR", survey = "acs5")
+
+county_pop_acs5
+```
+
+```{r acs1 year example}
+county_pop_acs1 <- get_acs(geography = "county", variables = total_population_acs_var_id, year = 2018, state = "OR", survey = "acs1")
+
+county_pop_acs1
+```
+
+
+We can label the variable rather than return the variable id
+```{r show variable labelign}
+get_acs(
+  geography = "county", 
+  variables = c(total_pop = total_population_acs_var_id), 
+  year = 2018, 
+  state = "OR", 
+  survey = "acs1"
+  )
+```
+
+
+```{r compare one year and five year sample}
+county_pop_acs5 <- county_pop_acs5 %>% 
+  select(-moe) %>% 
+  rename(five_year_pop_estimate = estimate)
+
+county_pop_acs1 <- county_pop_acs1 %>% 
+  select(-moe) %>% 
+  rename(one_year_pop_estimate = estimate)
+
+comparison_between_samples <- inner_join(county_pop_acs1, county_pop_acs5)
+
+comparison_between_samples
+```
+
+```{r visualize differences between samples}
+population_sample_comparison <- comparison_between_samples %>% 
+  mutate(relative_diff_in_pop = (one_year_pop_estimate / five_year_pop_estimate) - 1) %>% 
+  mutate(county = gsub(" County, Oregon", "", NAME)) 
+
+
+population_sample_comparison %>% 
+  ggplot() +
+  geom_bar(
+    aes(x = reorder(county, -relative_diff_in_pop), y = relative_diff_in_pop), stat = "identity"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "County",
+    y = "Pop Difference (1-year relative to 5-year sample)"
+  ) +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+What geographies are available?
+```{r tracts}
+or_census_tract_pop <- get_acs(geography = "tract", variables = total_population_acs_var_id, year = 2018, state = "OR", survey = "acs5")
+
+or_census_tract_pop
+```
+
+```{r block groups}
+multnomah_bg_pop <- get_acs(
+  geography = "block group", 
+  variables = total_population_acs_var_id, 
+  year = 2018, 
+  state = "OR", 
+  county = "Multnomah", 
+  survey = "acs5"
+  )
+
+multnomah_bg_pop
+```
+
+
+```{r blocks}
+get_acs(
+  geography = "block", 
+  variables = total_population_acs_var_id, 
+  year = 2018, 
+  state = "OR", 
+  county = "Multnomah", 
+  survey = "acs5"
+  )
+```
+
+```{r get block population from decennial}
+sf1_2010_vars <- load_variables(year = 2010, dataset = "sf1")
+
+# View(sf1_2010_vars)
+
+total_pop_2010_var_id <- "P001001"
+
+multnomah_block_pop <- get_decennial(
+  geography = "block", 
+  variables = total_pop_2010_var_id, 
+  year = 2010, 
+  state = "OR", 
+  county = "Multnomah", 
+  survey = "sf1"
+  )
+
+multnomah_block_pop
+```
+
+```{r how to crosswalk between}
+tract_fips_example <- "41051000100"
+bg_fips_example <- "410510001001"
+block_fips_example <- "410510001001002"
+
+nchar(tract_fips_example)
+nchar(bg_fips_example)
+nchar(block_fips_example)
+```
+
+
+### Spatial Analysis
+
+Tidycensus provides a very quick way to return spatial data from the census
+```{r returning geometry example}
+spatial_county_pop_acs5 <- get_acs(
+  geography = "county", 
+  variables = total_population_acs_var_id, 
+  year = 2018, 
+  state = "OR", 
+  survey = "acs5",
+  geometry = TRUE
+  )
+
+spatial_county_pop_acs5 %>% 
+  ggplot() +
+  geom_sf(aes(fill = estimate)) +
+  labs(fill = "Total Population") +
+  theme_minimal()
+```
+
+What if we want to get the shapes of a census area without getting census data, is there a way to just get the census shapes? tigris!
+```{r tigris example}
+or_counties <- tigris::counties(state = "OR")
+or_counties <- st_as_sf(or_counties)
+
+population_sample_comparison <- population_sample_comparison %>% 
+  select(GEOID, county, relative_diff_in_pop)
+
+or_counties_pop_diff <- inner_join(or_counties, population_sample_comparison)
+
+or_counties_pop_diff %>% 
+  ggplot() +
+  geom_sf(aes(fill = relative_diff_in_pop))
+```
+
+We can do more complicated spatial analysis as well
+```{r}
+# View(acs5_2018_variables)
+
+median_age_var_id <- "B01002_001"
+
+clackamas_county_tract_median_age <- get_acs(
+  geography = "tract", 
+  variables = median_age_var_id, 
+  year = 2018, 
+  state = "OR", 
+  county = "Clackamas", 
+  geometry = TRUE, 
+  survey = "acs5"
+  )
+```
+
+What if we want to know the median age for census tracts in a specific city?
+```{r}
+or_places_shapes <- st_as_sf(tigris::places(state = "OR"))
+
+lake_oswego_boundary <- or_places_shapes %>% 
+  filter(NAME == "Lake Oswego")
+
+lake_oswego_boundary <- st_transform(lake_oswego_boundary, crs = st_crs(clackamas_county_tract_median_age))
+
+lo_tracts <- st_join(clackamas_county_tract_median_age, lake_oswego_boundary, left = FALSE)
+```
+
+```{r}
+mapview(list(lo_tracts, lake_oswego_boundary))
+```
+
+Other than manually filtering is there a way we can only get the tracts that are mostly inside the boundary?
+```{r}
+tract_centroids <- st_centroid(clackamas_county_tract_median_age)
+lo_tracts <- st_join(tract_centroids, lake_oswego_boundary, left = FALSE)
+
+mapview(list(lo_tracts, lake_oswego_boundary))
+```
+
+One more try
+```{r}
+lo_tracts_redux <- clackamas_county_tract_median_age %>% 
+  filter(GEOID %in% lo_tracts$GEOID.x)
+
+mapview(list(lo_tracts_redux, lake_oswego_boundary))
+```
+Finish our analysis
+```{r}
+lo_tracts_redux %>% 
+  rename(median_age = estimate) %>% 
+  mapview(zcol = "median_age")
+```
+
